@@ -14,19 +14,35 @@ def create_api_client() -> "MarvinAPIClient":
     return MarvinAPIClient(
         api_key=settings.amazing_marvin_api_key,
         full_access_token=settings.amazing_marvin_full_access_token,
+        db_uri=settings.amazing_marvin_db_uri,
+        db_name=settings.amazing_marvin_db_name,
+        db_user=settings.amazing_marvin_db_user,
+        db_password=settings.amazing_marvin_db_password,
     )
 
 
 class MarvinAPIClient:
     """API client for Amazing Marvin"""
 
-    def __init__(self, api_key: str, full_access_token: str | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        full_access_token: str | None = None,
+        db_uri: str = "",
+        db_name: str = "",
+        db_user: str = "",
+        db_password: str = "",
+    ):
         """
         Initialize the API client with the API key
 
         Args:
             api_key: Amazing Marvin API key
             full_access_token: Optional full-access token for CRUD operations
+            db_uri: CouchDB base URI (e.g. https://user.cloudant.com)
+            db_name: CouchDB database name
+            db_user: CouchDB username for basic auth
+            db_password: CouchDB password for basic auth
         """
         self.api_key = api_key
         self.base_url = "https://serv.amazingmarvin.com/api"  # Removed v1 from URL
@@ -35,10 +51,73 @@ class MarvinAPIClient:
         self.full_access_headers: dict[str, str] | None = (
             {"X-Full-Access-Token": full_access_token} if full_access_token else None
         )
+        # Strip trailing slash to prevent double-slash in URLs like //{db}/_find.
+        self.db_uri = db_uri.rstrip("/")
+        self.db_name = db_name
+        self.db_user = db_user
+        self.db_password = db_password
 
     @property
     def has_full_access(self) -> bool:
         return bool(self.full_access_token)
+
+    @property
+    def has_couchdb(self) -> bool:
+        """True if all four CouchDB credentials are configured."""
+        return bool(self.db_uri and self.db_name and self.db_user and self.db_password)
+
+    def find_docs(
+        self,
+        selector: dict,
+        fields: list[str] | None = None,
+        limit: int = 500,
+    ) -> list[dict]:
+        """Query CouchDB directly using a Mango selector.
+
+        Requires all four CouchDB credentials to be configured
+        (AMAZING_MARVIN_DB_URI, _DB_NAME, _DB_USER, _DB_PASSWORD).
+
+        Args:
+            selector: CouchDB Mango selector dict (e.g. {"db": "SmartLists"})
+            fields: Optional list of fields to return per document.
+                    If None, all fields are returned.
+            limit: Maximum number of documents to return.
+
+        Returns:
+            List of matching documents.
+
+        Note: Hard limit of 500 docs per query — no pagination is implemented.
+        Callers must not rely on completeness for large result sets (Open Question 7).
+        """
+        if not self.has_couchdb:
+            raise ValueError(
+                "CouchDB credentials not fully configured. "
+                "Set AMAZING_MARVIN_DB_URI, AMAZING_MARVIN_DB_NAME, "
+                "AMAZING_MARVIN_DB_USER, and AMAZING_MARVIN_DB_PASSWORD."
+            )
+
+        url = f"{self.db_uri}/{self.db_name}/_find"
+        body: dict[str, Any] = {"selector": selector, "limit": limit}
+        if fields is not None:
+            body["fields"] = fields
+
+        # NB: Selectors may contain user data when find_docs is used beyond SmartLists/Habits.
+        # Keep at DEBUG level only.
+        logger.debug("CouchDB _find POST to %s with selector %s", url, selector)
+        try:
+            response = requests.post(
+                url,
+                json=body,
+                auth=(self.db_user, self.db_password),
+            )
+            response.raise_for_status()
+            return response.json().get("docs", [])
+        except requests.exceptions.HTTPError:
+            logger.exception("CouchDB HTTP error querying %s", url)
+            raise
+        except requests.exceptions.RequestException:
+            logger.exception("CouchDB request error querying %s", url)
+            raise
 
     def _make_request(
         self,

@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     amazing_marvin_full_access_token: str | None = Field(
         default=None, env="AMAZING_MARVIN_FULL_ACCESS_TOKEN"
     )
+    amazing_marvin_db_uri: str = Field(default="", env="AMAZING_MARVIN_DB_URI")
+    amazing_marvin_db_name: str = Field(default="", env="AMAZING_MARVIN_DB_NAME")
+    amazing_marvin_db_user: str = Field(default="", env="AMAZING_MARVIN_DB_USER")
+    amazing_marvin_db_password: str = Field(default="", env="AMAZING_MARVIN_DB_PASSWORD")
 
     # Server settings
     port: int = Field(default=3000, env="PORT")

@@ -76,6 +76,16 @@ def batch_create_tasks(
                 task_data["categoryId"] = category_id
 
             created_task = api_client.create_task(task_data)
+            # Work around /addTask inconsistency: parentId is not always persisted
+            # reliably via the addTask payload alone — patch it via update_document.
+            task_id = created_task.get("_id")
+            if task_id and "parentId" in task_data:
+                try:
+                    api_client.update_document(task_id, {"parentId": task_data["parentId"]})
+                except Exception as e:
+                    logger.warning(
+                        "Could not patch parentId for task %s: %s", task_id, e
+                    )
             created_tasks.append(created_task)
         except Exception as e:
             failed_tasks.append({"task": task_info, "error": str(e)})
