@@ -989,12 +989,19 @@ class TestNewMcpTools:
         from amazing_marvin_mcp.main import get_habits as get_habits_tool
 
         client = self._make_client()
-        client.get_habits.return_value = [{"_id": "h1", "title": "Exercise"}]
+        # The tool now uses get_enriched_habits, which prefers CouchDB
+        # find_docs when has_couchdb is True.
+        client.has_couchdb = True
+        client.find_docs.return_value = [
+            {"_id": "h1", "title": "Exercise", "db": "Habits", "period": "day"}
+        ]
         mock_create.return_value = client
 
         result = asyncio.run(get_habits_tool())
         assert result.success is True
-        assert result.data["habits"] == [{"_id": "h1", "title": "Exercise"}]
+        assert result.data["habits"] == [
+            {"_id": "h1", "title": "Exercise", "db": "Habits", "period": "day"}
+        ]
 
     @patch("amazing_marvin_mcp.main.create_api_client")
     def test_record_habit_tool_sends_record_action(self, mock_create: MagicMock) -> None:

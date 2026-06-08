@@ -20,7 +20,11 @@ from .analytics import (
 )
 from .api import create_api_client
 from .date_utils import DateUtils
-from .habits import get_habit_streak_impl
+from .habits import (
+    get_enriched_habit as get_enriched_habit_impl,
+    get_enriched_habits as get_enriched_habits_impl,
+    get_habit_streak_impl,
+)
 from .models import TaskUpdateRequest
 from .setters_builder import build_setters
 from .projects import (
@@ -1402,32 +1406,33 @@ async def get_completed_tasks_for_date(
 
 @mcp.tool()
 async def get_habits(debug: bool = False) -> StandardResponse:
-    """List all habits — REST PROJECTION ONLY (no `db`, `period` is an int code).
+    """List all habits as FULL CouchDB documents (title, target, recordType,
+    period as 'day'/'week'/'month', units, history, db, ...).
 
-    Important: the /habits REST endpoint returns a REDUCED projection of each habit doc:
-      - `db` is omitted.
-      - `period` is an integer code (NOT the strings "day"/"week"/"month").
-      - The full `history` array IS included but other meta fields may be trimmed.
+    Marvin's /api/habits endpoint by itself only returns a reduced
+    projection without title/target/db (and period as an int code), so
+    this tool enriches each entry to the canonical doc shape:
+      - If CouchDB direct access is configured, one Mango _find query.
+      - Otherwise: /api/habits + per-habit /api/doc?id= (N+1 round trips).
 
-    Use when: listing habits for the user (titles, _ids, targets).
+    Use when: listing habits for the user (titles, _ids, targets, etc.).
     Don't use for:
       - Streak calculations -> use get_habit_streak (handles bucketing + targets).
-      - Full raw habit doc (with `db`, period as string, full meta) -> use get_document
-        with the habit _id.
       - Recording / undoing a habit -> use record_habit / undo_habit.
 
-    Returns: `data.habits` (list). Hits /habits.
+    Returns: `data.habits` (list of full docs).
     """
     start_time = time.time()
     try:
         api_client = create_api_client()
-        habits = api_client.get_habits()
+        habits = get_enriched_habits_impl(api_client)
 
         return create_simple_response(
             data={"habits": habits},
             summary_text=f"Retrieved {len(habits)} habits",
             api_endpoint="/habits",
-            api_calls_made=1,
+            api_calls_made=1 if getattr(api_client, "has_couchdb", False)
+            else 1 + len(habits),
             debug=debug,
             start_time=start_time,
         )
@@ -1438,40 +1443,38 @@ async def get_habits(debug: bool = False) -> StandardResponse:
 
 @mcp.tool()
 async def get_habit(habit_id: str, debug: bool = False) -> StandardResponse:
-    """Get one habit by _id via the REST endpoint — REDUCED PROJECTION.
+    """Get one habit as the FULL CouchDB document (title, target, recordType,
+    period as 'day'/'week'/'month', units, history, db, ...).
 
-    Like get_habits, the /habit endpoint returns a slim view: no `db` field, `period` as an
-    integer code, possibly trimmed meta. The raw `history` array IS included.
+    Reads via /api/doc?id= so callers get the canonical doc shape (NOT the
+    reduced /api/habit projection that omits title/target/db).
 
-    Use when: you have a habit _id and need its REST-level info (title, target, history).
+    Use when: you have a habit _id and need its title, target, recordType, history.
     Don't use for:
-      - Streaks ("how many days in a row?") -> use get_habit_streak (does the bucketing
-        and target comparison this projection cannot do for you).
-      - The full raw CouchDB document with `db` set and `period` as a string ->
-        use get_document(habit_id).
+      - Streaks ("how many days in a row?") -> use get_habit_streak.
       - Recording / undoing -> use record_habit / undo_habit.
 
     Args:
         habit_id: Opaque CouchDB _id of the habit.
 
-    Returns: `data.habit` (raw payload). Hits /habit.
+    Returns: `data.habit` (full doc).
     """
     start_time = time.time()
     try:
         api_client = create_api_client()
-        habit = api_client.get_habit(habit_id)
+        habit = get_enriched_habit_impl(api_client, habit_id)
 
         return create_simple_response(
             data={"habit": habit},
             summary_text=f"Retrieved habit {habit_id}",
-            api_endpoint="/habit",
+            api_endpoint="/doc",
             api_calls_made=1,
             debug=debug,
             start_time=start_time,
         )
     except Exception as e:
         logger.exception("Failed to get habit %s", habit_id)
-        return create_error_response(e, "/habit", debug, start_time)
+        return create_error_response(e, "/doc", debug, start_time)
 
 
 @mcp.tool()

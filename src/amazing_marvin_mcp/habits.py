@@ -17,6 +17,49 @@ from zoneinfo import ZoneInfo
 
 ALLOWED_PERIODS = {"day", "week", "month"}
 
+HABIT_DB = "Habits"
+
+
+def get_enriched_habits(api_client) -> list[dict]:
+    """Return all habits as FULL CouchDB documents (with title, target, db,
+    `period` as a string, recordType, history, ...).
+
+    Marvin's REST endpoint ``/api/habits`` returns a reduced projection
+    without ``db``/``title``/``target`` and with ``period`` encoded as
+    an int. This helper unifies both code paths:
+
+    - When CouchDB direct access is configured (``has_couchdb=True``),
+      one Mango ``_find`` query returns the full docs.
+    - Otherwise, the REST endpoint is used as the habit-id source and
+      each habit is enriched via a per-id ``get_document`` call
+      (``/api/doc?id=…``). Costs N+1 round trips for N habits.
+    """
+    if getattr(api_client, "has_couchdb", False):
+        return api_client.find_docs({"db": HABIT_DB}, limit=500)
+
+    raw = api_client.get_habits()
+    enriched: list[dict] = []
+    for h in raw:
+        hid = h.get("habitId") or h.get("_id")
+        if not hid:
+            continue
+        try:
+            doc = api_client.get_document(hid)
+        except Exception:  # noqa: BLE001
+            # On lookup failure, fall back to the REST projection so the
+            # caller at least gets habitId + history. Title etc. remain
+            # unset.
+            enriched.append({**h, "_id": hid})
+            continue
+        enriched.append({**h, **doc, "_id": hid})
+    return enriched
+
+
+def get_enriched_habit(api_client, habit_id: str) -> dict:
+    """Return one habit as the FULL CouchDB document. Always uses
+    ``get_document`` (``/api/doc?id=…``) for the canonical shape."""
+    return api_client.get_document(habit_id)
+
 
 def _parse_history(history: list) -> list[tuple[int, float]]:
     """Convert flat ``[t1, v1, t2, v2, ...]`` into a sorted list of
