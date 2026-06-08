@@ -2071,15 +2071,20 @@ _SMART_LIST_CLAUSE_FIELDS = WRITABLE_CLAUSE_FIELDS
 
 
 def start():
-    """Start the MCP server"""
+    """Start the MCP server.
 
-    # Check if we should use HTTP transport (for Smithery deployment)
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    MCP_TRANSPORT selects the transport:
+      - "stdio" (default): subprocess pipe — used by Smithery, mcp-proxy as command.
+      - "http": FastMCP streamable HTTP at /mcp/.
+      - "sse":  FastMCP Server-Sent-Events at /sse — widest client compatibility,
+                preferred when fronting via tbxark/mcp-proxy `url` backends.
+    """
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
 
-    if transport.lower() == "http":
+    if transport in ("http", "sse"):
         host = os.getenv("MCP_HOST", "0.0.0.0")
         port = int(os.getenv("MCP_PORT", "8000"))
-        mcp.run(transport="http", host=host, port=port)
+        mcp.run(transport=transport, host=host, port=port)
     else:
         mcp.run()  # Default STDIO transport
 
