@@ -38,7 +38,7 @@ def test_calls_correct_url_with_default_base(monkeypatch):
 
     req = mock_open.call_args[0][0]
     assert req.full_url == (
-        "http://host.docker.internal:8000/api/v1/applications/proxy-uuid/restart"
+        "http://coolify:8080/api/v1/applications/proxy-uuid/restart"
     )
     assert req.get_method() == "GET"
     assert req.headers["Authorization"] == "Bearer secret-token"

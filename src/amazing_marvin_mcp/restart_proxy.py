@@ -10,9 +10,11 @@ Env vars required:
   MCP_PROXY_APP_UUID    — UUID of the application to restart (the
                           mcp-proxy app).
   COOLIFY_BASE_URL      — base URL of the Coolify server. Defaults to
-                          ``http://host.docker.internal:8000``, the
-                          host-bridge alias from inside a container on
-                          a single-node Coolify install.
+                          ``http://coolify:8080``, the Coolify container's
+                          own service name on the shared ``coolify``
+                          docker network. Override with the public URL
+                          (``https://coolify.example.com``) if the post-
+                          deploy container isn't on that network.
 
 Exits 0 on success, non-zero on failure. The deploy log will surface
 the failure, but a missing restart-target is non-fatal (we log and
@@ -33,9 +35,7 @@ logger = logging.getLogger(__name__)
 def restart_proxy() -> int:
     token = os.environ.get("COOLIFY_API_TOKEN", "").strip()
     target_uuid = os.environ.get("MCP_PROXY_APP_UUID", "").strip()
-    base = os.environ.get(
-        "COOLIFY_BASE_URL", "http://host.docker.internal:8000"
-    ).rstrip("/")
+    base = os.environ.get("COOLIFY_BASE_URL", "http://coolify:8080").rstrip("/")
 
     if not token or not target_uuid:
         print(
