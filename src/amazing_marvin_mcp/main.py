@@ -20,6 +20,7 @@ from .analytics import (
 )
 from .api import create_api_client
 from .date_utils import DateUtils
+from .enrichment import enrich_via_couchdb
 from .habits import (
     get_enriched_habit as get_enriched_habit_impl,
     get_enriched_habits as get_enriched_habits_impl,
@@ -130,22 +131,27 @@ async def get_tasks(debug: bool = False) -> StandardResponse:
 async def get_projects(debug: bool = False) -> StandardResponse:
     """List all projects (category docs with type=="project").
 
+    When CouchDB direct access is configured, the returned docs are
+    enriched with the fields the /api/categories projection strips —
+    `createdAt`, `updatedAt`, `db`, `rank`, `workedOnAt`. Without
+    CouchDB, the REST projection is returned as-is (cheap path).
+
     Use when: user needs to pick a project, browse the project tree, or you need a project's _id.
     Don't use for: tasks inside a project (use get_project_overview or get_child_tasks).
 
     Returns: `data` = list of project docs (each with _id, title, parentId, type, ...).
-    Hits /categories.
     """
     start_time = time.time()
     try:
         api_client = create_api_client()
         projects = api_client.get_projects()
+        projects = enrich_via_couchdb(api_client, projects, "Categories")
 
         return create_simple_response(
             data=projects,
             summary_text=f"Retrieved {len(projects)} projects",
             api_endpoint="/categories",
-            api_calls_made=1,
+            api_calls_made=2 if getattr(api_client, "has_couchdb", False) else 1,
             debug=debug,
             start_time=start_time,
         )
@@ -158,22 +164,27 @@ async def get_projects(debug: bool = False) -> StandardResponse:
 async def get_categories(debug: bool = False) -> StandardResponse:
     """List all categories (both type=="category" and type=="project").
 
+    When CouchDB direct access is configured, the returned docs are
+    enriched with `createdAt`, `updatedAt`, `db`, `done`, `doneDate`,
+    `rank`, `isFrogged` — fields the /api/categories projection strips.
+
     Use when: you need the full container tree including both categories and projects.
     Don't use for: only projects (use get_projects) or a single container's children
     (use get_child_tasks).
 
-    Returns: `data` = list of category/project docs. Hits /categories.
+    Returns: `data` = list of category/project docs.
     """
     start_time = time.time()
     try:
         api_client = create_api_client()
         categories = api_client.get_categories()
+        categories = enrich_via_couchdb(api_client, categories, "Categories")
 
         return create_simple_response(
             data=categories,
             summary_text=f"Retrieved {len(categories)} categories",
             api_endpoint="/categories",
-            api_calls_made=1,
+            api_calls_made=2 if getattr(api_client, "has_couchdb", False) else 1,
             debug=debug,
             start_time=start_time,
         )
