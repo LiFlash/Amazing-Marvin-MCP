@@ -16,6 +16,66 @@ they really need a specific field.
 from __future__ import annotations
 
 
+def _load_category_map(api_client) -> dict[str, dict]:
+    """Return ``{_id: doc}`` for ALL categories.
+
+    Prefers CouchDB ``_find`` because the REST ``/api/categories``
+    endpoint omits ``done: True`` containers — those are still valid
+    parents for tasks and projects.
+    """
+    if getattr(api_client, "has_couchdb", False):
+        cats = api_client.find_docs({"db": "Categories"}, limit=500)
+    else:
+        cats = api_client.get_categories()
+    return {c["_id"]: c for c in cats if c.get("_id")}
+
+
+def add_parent_breadcrumbs(
+    api_client,
+    items: list[dict],
+    *,
+    category_map: dict[str, dict] | None = None,
+) -> list[dict]:
+    """Mutate each item to include parent context.
+
+    Adds two keys, in-place:
+      - ``parent_path``  — list of titles from root to immediate parent
+                           (empty when the item has no resolvable parent).
+      - ``parent_title`` — immediate parent's title, or ``None``.
+
+    Walks ``parentId`` through the category map. Resolves to ``[]`` for
+    ``unassigned`` / ``None`` / unknown ids. Defends against cycles.
+
+    ``category_map`` may be passed in to avoid repeated lookups when the
+    caller already has it.
+    """
+    if not items:
+        return items
+
+    if category_map is None:
+        category_map = _load_category_map(api_client)
+
+    for item in items:
+        pid = item.get("parentId")
+        chain: list[str] = []
+        visited: set[str] = set()
+        while (
+            pid
+            and pid != "unassigned"
+            and pid in category_map
+            and pid not in visited
+        ):
+            visited.add(pid)
+            parent = category_map[pid]
+            title = parent.get("title")
+            if title:
+                chain.insert(0, title)
+            pid = parent.get("parentId")
+        item["parent_path"] = chain
+        item["parent_title"] = chain[-1] if chain else None
+    return items
+
+
 def enrich_via_couchdb(
     api_client,
     rest_items: list[dict],

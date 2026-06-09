@@ -20,7 +20,7 @@ from .analytics import (
 )
 from .api import create_api_client
 from .date_utils import DateUtils
-from .enrichment import enrich_via_couchdb
+from .enrichment import add_parent_breadcrumbs, enrich_via_couchdb
 from .habits import (
     get_enriched_habit as get_enriched_habit_impl,
     get_enriched_habits as get_enriched_habits_impl,
@@ -112,6 +112,7 @@ async def get_tasks(debug: bool = False) -> StandardResponse:
         api_client = create_api_client()
         today = DateUtils.get_today()
         raw_tasks = api_client.get_tasks(date=today)
+        add_parent_breadcrumbs(api_client, raw_tasks)
 
         return create_task_response(
             api_client=api_client,
@@ -146,6 +147,7 @@ async def get_projects(debug: bool = False) -> StandardResponse:
         api_client = create_api_client()
         projects = api_client.get_projects()
         projects = enrich_via_couchdb(api_client, projects, "Categories")
+        add_parent_breadcrumbs(api_client, projects)
 
         return create_simple_response(
             data=projects,
@@ -179,6 +181,7 @@ async def get_categories(debug: bool = False) -> StandardResponse:
         api_client = create_api_client()
         categories = api_client.get_categories()
         categories = enrich_via_couchdb(api_client, categories, "Categories")
+        add_parent_breadcrumbs(api_client, categories)
 
         return create_simple_response(
             data=categories,
@@ -208,6 +211,7 @@ async def get_due_items(debug: bool = False) -> StandardResponse:
     try:
         api_client = create_api_client()
         due_items = api_client.get_due_items()
+        add_parent_breadcrumbs(api_client, due_items)
 
         return create_simple_response(
             data={"due_items": due_items},
@@ -259,6 +263,10 @@ async def get_child_tasks(
             ]
             projects = [item for item in children if item.get("type") == "project"]
             categories = [item for item in children if item.get("type") == "category"]
+
+            # Annotate every child with its parent breadcrumb so the LLM
+            # immediately knows the context without further lookups.
+            add_parent_breadcrumbs(api_client, children)
 
             result = {
                 "parent_id": parent_id,
@@ -313,6 +321,10 @@ async def get_all_tasks(
     try:
         api_client = create_api_client()
         result = get_all_tasks_impl(api_client, label, fields)
+
+        # Annotate tasks with parent breadcrumbs so the LLM sees context.
+        if isinstance(result, dict) and isinstance(result.get("tasks"), list):
+            add_parent_breadcrumbs(api_client, result["tasks"])
 
         # Estimate API calls based on typical project count
         estimated_api_calls = result.get("api_calls_made", 5)
