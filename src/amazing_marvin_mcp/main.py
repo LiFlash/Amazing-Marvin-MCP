@@ -21,6 +21,12 @@ from .analytics import (
 from .api import create_api_client
 from .date_utils import DateUtils
 from .enrichment import add_parent_breadcrumbs, enrich_via_couchdb
+from .goals import (
+    get_enriched_goal as get_enriched_goal_impl,
+    get_goal_tasks_impl,
+    link_task_to_goal_impl,
+    unlink_task_from_goal_impl,
+)
 from .habits import (
     get_enriched_habit as get_enriched_habit_impl,
     get_enriched_habits as get_enriched_habits_impl,
@@ -392,12 +398,21 @@ async def update_document(
     silently no-op or corrupt the document.
 
     Use when: a more specific tool does not cover what you need (e.g. clearing a field by
-    setting it to null, editing an exotic doc type, editing a label/goal).
+    setting it to null, editing an exotic doc type, editing a label).
     Don't use for:
       - SmartLists  -> use update_smart_list (validates db + whitelist)
       - Habits (record/undo) -> use record_habit / undo_habit
       - Standard task fields -> use update_task (typed, named, validated)
       - Marking a task complete -> use mark_task_done
+      - **Linking a task/project/habit to a goal** -> use link_task_to_goal /
+        unlink_task_from_goal (these set the canonical `g_in_<GID>`,
+        `g_sec_<GID>`, `g_rank_<GID>` fields on the item; setting them by hand
+        here works but is unobvious and easy to get wrong).
+      - **Mutating Goal documents** (status, sections/milestones, motivations,
+        challenges, check-ins) -> currently unsupported in this MCP. Goal-doc
+        writes are intentionally NOT exposed because malformed goal docs sync
+        to all Marvin clients and can break the UI; create/edit goals in the
+        Marvin app itself.
 
     Args:
         item_id: Opaque CouchDB _id of the document to update.
@@ -614,9 +629,27 @@ async def get_labels(debug: bool = False) -> StandardResponse:
 async def get_goals(debug: bool = False) -> StandardResponse:
     """List all goals defined in the account.
 
+    A Marvin **Goal** is a strategic objective with rich structure. Each goal can have:
+      - `status` in {"backburner", "pending", "active", "done"}
+      - `dueDate` + `hasEnd` (true = end-goal, false = ongoing)
+      - `motivations`, `challenges[{_id, challenge, action}]`,
+        `importance` (1-5), `difficulty` (1-5)
+      - `expectedTasks` / `expectedDuration` / `expectedHabits` per week
+      - `checkIn` cadence (`checkInWeeks`, `checkInStart`, `lastCheckIn`,
+        `checkInQuestions`)
+      - **`sections[]`** — the goal's milestones / phases, each `{_id, title, note}`
+
+    Tasks / Projects / Habits are **not** stored inside the goal. Linking is on the
+    item side via three per-goal fields: `g_in_<GOAL_ID>=true`,
+    `g_sec_<GOAL_ID>="<section_id>"`, `g_rank_<GOAL_ID>=<int>`. Use
+    `get_goal` to expand a single goal with its linked items + section breakdown,
+    or `link_task_to_goal` to attach items.
+
     Use when: you need a goal's _id (e.g. to set `goalId` clauses on a SmartList) or to
-    inspect the user's strategic goals.
-    Don't use for: tasks linked to a goal (filter via SmartList with `goalId` clause).
+    enumerate the user's strategic goals.
+    Don't use for: full goal contents incl. sections + linked tasks
+    (use `get_goal(goal_id)`), or listing tasks linked to a goal (use
+    `get_goal_tasks`).
 
     Returns: `data.goals` (list). Hits /goals.
     """
@@ -636,6 +669,206 @@ async def get_goals(debug: bool = False) -> StandardResponse:
     except Exception as e:
         logger.exception("Failed to get goals")
         return create_error_response(e, "/goals", debug, start_time)
+
+
+@mcp.tool()
+async def get_goal(goal_id: str, debug: bool = False) -> StandardResponse:
+    """Read a single goal expanded with sections (= milestones) + linked items.
+
+    Returns the raw goal doc (all fields — status, motivations, challenges,
+    checkIn*, expectedTasks, ...) plus the following synthesized keys:
+      - `sections_with_items`  — each section dict gets an `items` list of
+        tasks/projects/habits assigned to that section (sorted by goal-rank).
+      - `unsectioned_items`    — linked items with no section assignment.
+      - `linked_items`         — flat list of all items with
+        `g_in_<goal_id>=true` (each item denormalized with
+        `goal_section_id` + `goal_rank`).
+      - `linked_summary`       — counts {total, tasks, projects, habits,
+        done, open}.
+      - `progress`             — only when goal has `expectedTasks`:
+        {done, expected_tasks, ratio}.
+
+    Requires CouchDB credentials for the linked-items aggregation. Without
+    CouchDB the goal-doc + sections are still returned; linked items come
+    back empty with `linked_items_note`.
+
+    Use when: you want the full strategic picture of one goal — milestones,
+    what's attached, how much is done.
+    Don't use for: listing all goals (use `get_goals`); fetching just a
+    goal's raw doc (use `get_document`).
+
+    Args:
+        goal_id: The goal's `_id`.
+
+    Returns: `data` = enriched goal dict. Hits /doc?id + CouchDB _find.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        enriched = get_enriched_goal_impl(api_client, goal_id)
+
+        return create_simple_response(
+            data=enriched,
+            summary_text=(
+                f"Goal '{enriched.get('title')}' — "
+                f"{enriched['linked_summary']['total']} linked items "
+                f"({enriched['linked_summary']['done']} done)"
+            ),
+            api_endpoint="/doc + /_find",
+            api_calls_made=2,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to get goal %s", goal_id)
+        return create_error_response(e, "/doc + /_find", debug, start_time)
+
+
+@mcp.tool()
+async def get_goal_tasks(
+    goal_id: str,
+    section_id: str | None = None,
+    include_done: bool = True,
+    debug: bool = False,
+) -> StandardResponse:
+    """List Tasks / Projects / Habits attached to a goal (optionally by section).
+
+    Filters by `g_in_<goal_id>=true` on the item side. Results are sorted by
+    `g_rank_<goal_id>` (items without a rank sort last).
+
+    Requires CouchDB credentials (AMAZING_MARVIN_DB_*). Without CouchDB use
+    a SmartList with a `goalId` clause as a workaround.
+
+    Use when: you need the concrete to-do list that "counts toward" a goal,
+    or want to inspect what's in one specific milestone (section).
+    Don't use for: a single goal's overview with progress (use `get_goal`).
+
+    Args:
+        goal_id: The goal's `_id`.
+        section_id: Optional section/milestone `_id` from the goal's `sections[]`
+            to narrow the list to one milestone.
+        include_done: If False, omit completed items.
+
+    Returns: `data.items` (list). Hits CouchDB _find.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        items = get_goal_tasks_impl(
+            api_client, goal_id, section_id=section_id, include_done=include_done
+        )
+
+        return create_simple_response(
+            data={"items": items, "goal_id": goal_id, "section_id": section_id},
+            summary_text=f"Retrieved {len(items)} item(s) linked to goal {goal_id}",
+            api_endpoint="/_find",
+            api_calls_made=2,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to get goal tasks for %s", goal_id)
+        return create_error_response(e, "/_find", debug, start_time)
+
+
+@mcp.tool()
+async def link_task_to_goal(
+    item_id: str,
+    goal_id: str,
+    section_id: str | None = None,
+    rank: int | None = None,
+    debug: bool = False,
+) -> StandardResponse:
+    """Attach a Task / Project / Habit to a Goal (optionally into one of its sections).
+
+    Requires AMAZING_MARVIN_FULL_ACCESS_TOKEN. **Mutates only the item doc**,
+    never the Goal doc. Writes three per-goal fields on the item:
+      - `g_in_<goal_id>` = true
+      - `g_sec_<goal_id>` = <section_id>   (only if provided; must exist
+        in the goal's `sections[]`)
+      - `g_rank_<goal_id>` = <rank>        (only if provided)
+
+    Pre-flight verifies the goal exists (db="Goals") and the item is a
+    Task/Project/Habit. If `section_id` is given it must match one of the
+    goal's existing section `_id`s — otherwise the call is rejected.
+
+    Use when: a task/project/habit should "count toward" a goal, or you
+    want to place it into a specific milestone.
+    Don't use for: setting the `g_*` fields directly via `update_document`
+    (this tool handles validation + `updatedAt` for you).
+
+    Args:
+        item_id: `_id` of the Task / Project / Habit to attach.
+        goal_id: `_id` of the Goal to attach to.
+        section_id: Optional milestone/section `_id` from the goal's `sections[]`.
+        rank: Optional integer for ordering within the section.
+
+    Returns: `data` = updated item doc. Hits /doc?id (×2 safety) + /doc/update.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = link_task_to_goal_impl(
+            api_client, item_id, goal_id, section_id=section_id, rank=rank
+        )
+
+        return create_simple_response(
+            data=result,
+            summary_text=(
+                f"Linked item {item_id} to goal {goal_id}"
+                + (f" (section {section_id})" if section_id else "")
+            ),
+            api_endpoint="/doc/update",
+            api_calls_made=3,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to link %s to goal %s", item_id, goal_id)
+        return create_error_response(e, "/doc/update", debug, start_time)
+
+
+@mcp.tool()
+async def unlink_task_from_goal(
+    item_id: str,
+    goal_id: str,
+    debug: bool = False,
+) -> StandardResponse:
+    """Detach a Task / Project / Habit from a Goal.
+
+    Requires AMAZING_MARVIN_FULL_ACCESS_TOKEN. Clears the three per-goal
+    fields on the item (`g_in_<GID>`, `g_sec_<GID>`, `g_rank_<GID>`) by
+    setting them to `null` — Marvin's documented way to remove a field via
+    `/doc/update`. **Only the item is mutated.**
+
+    Pre-flight verifies the goal exists and the item is a Task/Project/Habit.
+
+    Use when: the item no longer belongs to that goal.
+    Don't use for: deleting the goal itself (not supported here — use the
+    Marvin UI).
+
+    Args:
+        item_id: `_id` of the Task / Project / Habit to detach.
+        goal_id: `_id` of the Goal to detach from.
+
+    Returns: `data` = updated item doc. Hits /doc?id (×2) + /doc/update.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = unlink_task_from_goal_impl(api_client, item_id, goal_id)
+
+        return create_simple_response(
+            data=result,
+            summary_text=f"Unlinked item {item_id} from goal {goal_id}",
+            api_endpoint="/doc/update",
+            api_calls_made=3,
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to unlink %s from goal %s", item_id, goal_id)
+        return create_error_response(e, "/doc/update", debug, start_time)
 
 
 @mcp.tool()
