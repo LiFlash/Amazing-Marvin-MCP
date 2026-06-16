@@ -1,4 +1,4 @@
-"""Goals helpers — Stufe 1 (read + Task↔Goal linking only).
+"""Goals helpers — read, linking, and safe scalar edits.
 
 Marvin's goal model (from MarvinAPI wiki — "Goals" data type):
   - `db`     = "Goals"
@@ -13,10 +13,13 @@ per-goal fields:
   - g_sec_<GOAL_ID> = "<sec_id>"  — section/phase within the goal
   - g_rank_<GOAL_ID> = <int>      — ordering within section
 
-This module exposes read-only helpers and Task-side linking only.
-Direct Goal-doc mutation (create/update/delete, milestone CRUD) is NOT
-implemented in this stage — it would write into Marvin's Goal docs,
-which sync to all clients and could break the UI on malformed input.
+This module exposes:
+  - read helpers (get_enriched_goal, get_goal_tasks_impl)
+  - task-side linking (link_task_to_goal_impl, unlink_task_from_goal_impl)
+  - **scalar Goal-doc edits** (update_goal_impl) — whitelisted set of
+    safe fields only. Array fields (sections / challenges / checkIn*)
+    and Goal creation/deletion are intentionally NOT exposed here —
+    they need their own validation layer (next stage).
 """
 
 from __future__ import annotations
@@ -26,6 +29,52 @@ from typing import Any
 
 GOALS_DB = "Goals"
 LINKABLE_DBS = {"Tasks", "Categories", "Habits"}
+
+# Status enum — from Marvin wiki and confirmed against live Test Goal.
+GOAL_STATUSES = {"backburner", "pending", "active", "done"}
+
+# Whitelisted scalar fields update_goal_impl may write.
+# Each entry: (python_type, optional_validator) where validator(value) -> None
+# raises ValueError on bad input. None for type means "no type check".
+_UPDATE_GOAL_FIELDS: dict[str, tuple[Any, Any]] = {
+    # Core
+    "title":             (str,  None),
+    "note":              (str,  None),
+    "status":            (str,  lambda v: _check_in(v, GOAL_STATUSES, "status")),
+    "dueDate":           (str,  None),   # "YYYY-MM-DD" or None to clear
+    "hasEnd":            (bool, None),
+    "hideInDayView":     (bool, None),
+    "isStarred":         (int,  lambda v: _check_range(v, 0, 1, "isStarred")),
+    "parentId":          (str,  None),
+    # Commitment Contract (UI step 6)
+    "importance":        (int,  lambda v: _check_range(v, 1, 5, "importance")),
+    "difficulty":        (int,  lambda v: _check_range(v, 1, 5, "difficulty")),
+    "motivations":       (str,  None),
+    # Expectations (UI step 4) — wiki: minutes/week for duration, ints for tasks.
+    "expectedTasks":     (int,  lambda v: _check_nonneg(v, "expectedTasks")),
+    "expectedDuration":  (int,  lambda v: _check_nonneg(v, "expectedDuration")),
+    "expectedHabits":    (str,  None),   # free-text grade like "B-"
+}
+
+# Fields whose presence indicates the UI checklist step is satisfied.
+_HAS_EXPECTATIONS_FIELDS = ("expectedTasks", "expectedDuration", "expectedHabits")
+
+
+def _check_in(value, allowed, field_name):
+    if value not in allowed:
+        raise ValueError(
+            f"{field_name}={value!r} not in allowed values {sorted(allowed)}"
+        )
+
+
+def _check_range(value, lo, hi, field_name):
+    if not (lo <= value <= hi):
+        raise ValueError(f"{field_name}={value!r} not in range [{lo}, {hi}]")
+
+
+def _check_nonneg(value, field_name):
+    if value < 0:
+        raise ValueError(f"{field_name}={value!r} must be >= 0")
 
 
 def _verify_goal(api_client, goal_id: str) -> dict:
@@ -144,7 +193,103 @@ def get_enriched_goal(api_client, goal_id: str) -> dict:
             "ratio": round(done_count / expected, 3),
         }
 
+    enriched["setup_status"] = _compute_setup_status(goal, has_actions=bool(linked))
     return enriched
+
+
+def _compute_setup_status(goal: dict, *, has_actions: bool) -> dict:
+    """Map the Marvin UI's 6-step goal setup checklist to booleans.
+
+    UI steps (Marvin in-app help text):
+      1. Check Goal              — title set & positively framed (we only check non-empty)
+      2. Trackers & Progress     — any ``trackerProgress_*`` key OR has_trackers metadata
+      3. Add Actions             — at least one Task/Project/Habit linked
+      4. Set Expectations        — expectedTasks / Duration / Habits set
+      5. Set Up Check-Ins        — checkIn enabled
+      6. Commit                  — status != "pending" (user filled commitment contract)
+
+    Returns ``{is_*: bool, missing_steps: [str]}`` so callers can show a
+    "next steps" hint to the user.
+    """
+    title = (goal.get("title") or "").strip()
+    has_title = bool(title)
+    has_trackers = any(k.startswith("trackerProgress_") for k in goal.keys())
+    has_expectations = any(
+        goal.get(f) not in (None, 0, "", []) for f in _HAS_EXPECTATIONS_FIELDS
+    )
+    has_checkins = bool(goal.get("checkIn"))
+    is_committed = goal.get("status") not in (None, "pending")
+
+    steps = {
+        "has_title": has_title,
+        "has_trackers": has_trackers,
+        "has_actions": has_actions,
+        "has_expectations": has_expectations,
+        "has_checkins": has_checkins,
+        "is_committed": is_committed,
+    }
+    labels = {
+        "has_title": "1. Check Goal — set a title",
+        "has_trackers": "2. Set up Trackers & Progress",
+        "has_actions": "3. Add Actions (Tasks/Projects/Habits)",
+        "has_expectations": "4. Set Expectations (expectedTasks/Duration/Habits)",
+        "has_checkins": "5. Set Up Check-Ins",
+        "is_committed": "6. Commit (status != 'pending')",
+    }
+    missing = [labels[k] for k, v in steps.items() if not v]
+    return {**steps, "missing_steps": missing}
+
+
+def update_goal_impl(api_client, goal_id: str, **changes) -> dict:
+    """Patch whitelisted scalar fields on a Goal document.
+
+    Only scalar fields are accepted (see ``_UPDATE_GOAL_FIELDS``). Array
+    fields (sections, challenges, checkIn questions, labelIds) and
+    tracker config are intentionally excluded — they need their own
+    typed CRUD operations.
+
+    Pre-flight verifies the doc actually has ``db == "Goals"``. Bumps
+    ``updatedAt``. Returns the API response from ``/doc/update``.
+
+    Pass ``None`` for a value to clear that field (Marvin's documented
+    semantics for /doc/update).
+    """
+    if not changes:
+        raise ValueError("update_goal requires at least one field to change.")
+
+    unknown = set(changes) - set(_UPDATE_GOAL_FIELDS)
+    if unknown:
+        raise ValueError(
+            f"Field(s) {sorted(unknown)} not in update_goal whitelist. "
+            f"Allowed: {sorted(_UPDATE_GOAL_FIELDS)}. For array fields "
+            f"(sections, challenges, checkIn*, labelIds) use a future "
+            f"typed CRUD tool — not exposed yet."
+        )
+
+    for field, value in changes.items():
+        if value is None:
+            continue  # clear semantics — skip type/validator checks
+        expected_type, validator = _UPDATE_GOAL_FIELDS[field]
+        if expected_type is bool and not isinstance(value, bool):
+            raise ValueError(
+                f"{field}={value!r} must be bool (got {type(value).__name__})"
+            )
+        if expected_type is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ValueError(
+                f"{field}={value!r} must be int (got {type(value).__name__})"
+            )
+        if expected_type is str and not isinstance(value, str):
+            raise ValueError(
+                f"{field}={value!r} must be str (got {type(value).__name__})"
+            )
+        if validator is not None:
+            validator(value)
+
+    _verify_goal(api_client, goal_id)
+
+    setters = dict(changes)
+    setters["updatedAt"] = int(time.time() * 1000)
+    return api_client.update_document(goal_id, setters)
 
 
 def get_goal_tasks_impl(

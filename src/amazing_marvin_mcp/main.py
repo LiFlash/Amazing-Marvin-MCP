@@ -26,6 +26,7 @@ from .goals import (
     get_goal_tasks_impl,
     link_task_to_goal_impl,
     unlink_task_from_goal_impl,
+    update_goal_impl,
 )
 from .habits import (
     get_enriched_habit as get_enriched_habit_impl,
@@ -687,6 +688,11 @@ async def get_goal(goal_id: str, debug: bool = False) -> StandardResponse:
         done, open}.
       - `progress`             — only when goal has `expectedTasks`:
         {done, expected_tasks, ratio}.
+      - `setup_status`         — maps the Marvin UI's 6-step goal-setup
+        checklist to booleans (`has_title`, `has_trackers`, `has_actions`,
+        `has_expectations`, `has_checkins`, `is_committed`) plus a
+        `missing_steps` list. Tells you at a glance what's left to make
+        the goal ready (e.g. status still "pending" → not committed).
 
     Requires CouchDB credentials for the linked-items aggregation. Without
     CouchDB the goal-doc + sections are still returned; linked items come
@@ -825,6 +831,71 @@ async def link_task_to_goal(
         )
     except Exception as e:
         logger.exception("Failed to link %s to goal %s", item_id, goal_id)
+        return create_error_response(e, "/doc/update", debug, start_time)
+
+
+@mcp.tool()
+async def update_goal(
+    goal_id: str,
+    changes: dict[str, Any],
+    debug: bool = False,
+) -> StandardResponse:
+    """Patch whitelisted scalar fields on a Goal.
+
+    Requires AMAZING_MARVIN_FULL_ACCESS_TOKEN. **Mutates the Goal doc.**
+    Only the following scalar fields are accepted (typed + range-validated):
+
+      - `title` (str), `note` (str)
+      - `status` ∈ {"backburner", "pending", "active", "done"}
+      - `dueDate` "YYYY-MM-DD" or None to clear
+      - `hasEnd` (bool: true=end-goal, false=ongoing)
+      - `hideInDayView` (bool)
+      - `isStarred` (int 0 or 1)
+      - `parentId` (str — category id or "unassigned")
+      - **Commitment Contract** (UI step 6): `importance` 1-5, `difficulty` 1-5,
+        `motivations` (str)
+      - **Expectations** (UI step 4): `expectedTasks` int≥0,
+        `expectedDuration` int≥0 (minutes/week), `expectedHabits` str
+
+    Pre-flight verifies `db == "Goals"`. Bumps `updatedAt`. Pass `None`
+    for a value to clear a field.
+
+    NOT supported (use the Marvin UI or wait for future tools):
+      - Array fields: `sections` (milestones), `challenges`, `labelIds`,
+        `checkInQuestions`
+      - Check-In cadence: `checkIn`, `checkInWeeks`, `checkInStart`,
+        `lastCheckIn`
+      - Tracker progress: `trackerProgress_*`
+      - Goal creation/deletion
+
+    Use when: editing one or a few simple goal fields (e.g. activate a
+    goal: `{"status": "active"}`, set a due date, change importance).
+    Don't use for: milestone changes, check-in setup, tracker config.
+
+    Args:
+        goal_id: The goal's `_id`.
+        changes: Dict of {field: new_value}. Whitelist-validated;
+            unknown fields are rejected with an explanatory error.
+
+    Returns: `data` = updated goal doc with new `_rev`.
+    """
+    start_time = time.time()
+    try:
+        api_client = create_api_client()
+        result = update_goal_impl(api_client, goal_id, **changes)
+
+        return create_simple_response(
+            data=result,
+            summary_text=(
+                f"Updated goal {goal_id} — fields: {sorted(changes)}"
+            ),
+            api_endpoint="/doc/update",
+            api_calls_made=2,  # verify + update
+            debug=debug,
+            start_time=start_time,
+        )
+    except Exception as e:
+        logger.exception("Failed to update goal %s", goal_id)
         return create_error_response(e, "/doc/update", debug, start_time)
 
 
