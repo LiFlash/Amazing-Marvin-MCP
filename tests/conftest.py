@@ -1,8 +1,9 @@
 """Pytest session hooks.
 
 The live integration tests in ``tests/test_api.py`` create real
-``Pytest Test Project ...`` projects and ``Test Task N`` children in
-Amazing Marvin via the REST API. They had no teardown originally, so
+``Pytest Test Project - <timestamp>`` projects and
+``Pytest Test Task - <timestamp>`` children in Amazing Marvin via the
+REST API. They had no teardown originally, so
 junk would pile up in the user's Marvin account. This fixture runs
 once per session, snapshots the set of pytest-style project titles
 *before* the run, and after the run deletes anything that matches the
@@ -23,7 +24,7 @@ import pytest
 logger = logging.getLogger(__name__)
 
 _PROJECT_PAT = re.compile(r"^Pytest Test Project - \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
-_TASK_PAT = re.compile(r"^Test Task \d+$")
+_TASK_PAT = re.compile(r"^Pytest Test Task - \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
 # Real user-created items that LOOK pytest-y but must never be deleted.
 _PROTECTED_TITLES = {"Auftankaktivitäten testen", "Test Scheduling"}
 

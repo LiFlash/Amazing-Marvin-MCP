@@ -30,6 +30,14 @@ from amazing_marvin_mcp.tasks import (
 # Constants for tests
 TASK_COUNT = 3  # Number of tasks to create in tests
 
+# Shared with tests/conftest.py teardown so the cleanup pattern can never
+# drift out of sync with what the tests actually create. Bug history: an
+# earlier version of conftest hard-coded `^Test Task \d+$`, which never
+# matched these titles — junk piled up in Marvin for months.
+PYTEST_TASK_TITLE_PREFIX = "Pytest Test Task - "
+PYTEST_PROJECT_TITLE_PREFIX = "Pytest Test Project - "
+PYTEST_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 
 @pytest.fixture
 def api_client():
@@ -47,7 +55,7 @@ def api_client():
 def test_project_data():
     """Test project data."""
     return {
-        "title": f"Pytest Test Project - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "title": f"{PYTEST_PROJECT_TITLE_PREFIX}{datetime.now().strftime(PYTEST_TIMESTAMP_FORMAT)}",
         "type": "project",
     }
 
@@ -56,7 +64,7 @@ def test_project_data():
 def test_task_data():
     """Test task data."""
     return {
-        "title": f"Pytest Test Task - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "title": f"{PYTEST_TASK_TITLE_PREFIX}{datetime.now().strftime(PYTEST_TIMESTAMP_FORMAT)}",
         "note": "This is a test task created by pytest",
     }
 
